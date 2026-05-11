@@ -1,0 +1,27 @@
+# Python 缓存和编译文件
+__pycache__/
+*.py[cod]
+*.pyo
+
+# IDE 配置 (PyCharm)
+.idea/
+
+# 训练日志和输出 (通常较大且自动生成)
+logs/
+outputs/
+
+# 模型权重文件 (通常很大，不适合 Git，可用 Git LFS 或云存储)
+*.pth
+*.pt
+*.ckpt
+*.zip
+*.tar.gz
+
+# 临时文件
+*.tmp
+*.swp
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db

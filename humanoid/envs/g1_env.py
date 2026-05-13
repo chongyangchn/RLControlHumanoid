@@ -28,7 +28,7 @@ class HumanoidG1Env:
 
         # 观测量维度后续试一下两种不同的观测量：
         # self.obs_dim = 5 + self.num_joints * 2   # z轴高度 + 四元数（5） + 关节位置、速度 + Torso 角速度 + 线加速度 + Pelvis 角速度 + 线加速度
-        self.obs_dim = 5 + self.num_joints * 2 + self.action_dim  # z轴高度 + 四元数（5） + 关节位置、速度 + Torso 角速度 + 线加速度 + Pelvis 角速度 + 线加速度 + 上一时刻动作
+        self.obs_dim = 1 + 4 + 6 + self.num_joints * 2 + self.action_dim  # z轴高度 + 四元数（5） + 关节位置、速度 + Torso 角速度 + 线加速度 + Pelvis 角速度 + 线加速度 + 上一时刻动作
 
         # 默认站立姿态 (读取初始的控制量)
         self.default_stand = self.data.ctrl.copy()
@@ -52,11 +52,11 @@ class HumanoidG1Env:
         # 奖励系数（可配置）
         if reward_scaling is None:
             self.reward_scaling = {
-                'vel': 2.0,  # 速度奖励系数
-                'height': 2.0,  # 高度奖励系数
-                'upright': 3.0,  # 竖直奖励系数
-                'smooth': -0.005,  # 动作平滑惩罚系数
-                'survival': 0.1,  # 每步生存奖励
+                'vel': 0.5,  # 速度奖励系数
+                'height': 0.5,  # 高度奖励系数
+                'upright': 0.8,  # 竖直奖励系数
+                'smooth': -0.03,  # 动作平滑惩罚系数
+                'survival': 0.05,  # 每步生存奖励
             }
         print(f"[Env] Loaded G1 | 控制量维度={self.action_dim} | 观测量维度={self.obs_dim} | 时间步长{self.dt:.3f}s")
 
@@ -107,25 +107,44 @@ class HumanoidG1Env:
         # 提取高度和四元数 (Base Position/Orientation)
         # qpos[:3] 是 XYZ, qpos[3:7] 是四元数
         # 关节位置（粗略归一化到 [-1,1]）
-        base_pos = self.data.qpos[2:3].flatten()  # 只取高度 Z   # 确保是 (1,)
-        base_quat = self.data.qpos[3:7].flatten()    # 确保是 (4,)
+        base_pos = (self.data.qpos[2:3].flatten()  - 0.78) / 0.3 # 只取高度 Z   # 确保是 (1,)  # 大约归一化到 [-1.5,1.5]
+        base_quat = self.data.qpos[3:7].flatten()    # 确保是 (4,)   # 已在 [-1,1]
+        base_vel_raw = self.data.qvel[0:6].flatten()   # 6 维
+        base_vel = np.clip(base_vel_raw / [5.0,5.0,5.0,10.0,10.0,10.0], -1.0, 1.0)
 
         # 关节位置与速度 (仅限受控的29个关节)
-        joint_pos = self.data.qpos[7:].flatten()   # 确保是 (29,)
-        joint_vel = self.data.qvel[6:].flatten()  # qvel前6位是自由座的速度   # 确保是 (29,)
-        last_action = self.last_action.flatten()   # 确保是 (29,)
+        joint_pos_raw = self.data.qpos[7:].flatten()   # 确保是 (29,)
+        joint_range = self.joint_high - self.joint_low
+        joint_pos = 2.0 * (joint_pos_raw - self.joint_low) / (joint_range + 1e-8) - 1.0
+
+        joint_vel_raw = self.data.qvel[6:].flatten()  # qvel前6位是自由座的速度   # 确保是 (29,)
+        joint_vel = np.clip(joint_vel_raw / 20.0, -1.0, 1.0)
+        last_action = self.last_action.flatten()   # 确保是 (29,)   # 已在 [-1,1] 内
 
 
         # obs_data = np.concatenate([base_pos, base_quat, joint_pos, joint_vel]).astype(np.float32)  # 维度为：base_pos： 1   base_quat：4    joint_pos：29  joint_vel：29  相加是63
-        obs_data = np.concatenate([base_pos, base_quat, joint_pos, joint_vel, last_action]).astype(np.float32) # 维度为：base_pos： 1   base_quat：4    joint_pos：29  joint_vel：29   last_action： 29  相加是92
+        obs_data = np.concatenate([
+            base_pos, base_quat, base_vel,          # 1 + 4 + 6 = 11
+            joint_pos, joint_vel, last_action       # 29 + 29 + 29 = 87
+        ]).astype(np.float32) # 维度为：base_pos： 1   base_quat：4    joint_pos：29  joint_vel：29   last_action： 29  相加是92
+        # 总维度: 11 + 87 = 98
         return obs_data
 
 
     # ─────────────────────────── Reward ──────────────────────────
     def _get_reward(self, action):
         """初步的奖励函数：比如根据躯干高度和前进速度"""
+        # forward_vel = self.data.qvel[0]  # 是世界系 x 轴速度，
+
+        quat = self.data.qpos[3:7].copy()
+        rot_mat = np.zeros(9)
+        mujoco.mju_quat2Mat(rot_mat, quat)
+        rot_mat = rot_mat.reshape(3, 3)
+        global_vel = self.data.qvel[0:3]
+        local_vel = rot_mat.T @ global_vel # 局部坐标系速度
+        forward_vel = local_vel[0]  # 机器人前进方向（通常是 x 轴）
+
         height = self.data.qpos[2]
-        forward_vel = self.data.qvel[0]
         upright = self._get_upright_reward()  # [0,1] 躯干直立程度
 
         reward_vel = self.reward_scaling['vel'] * np.exp(-2.0 * (forward_vel - 0.6)**2)                             # 1. 速度奖励 (目标 0.6 m/s)
@@ -141,7 +160,7 @@ class HumanoidG1Env:
         """判断是否摔倒或任务结束"""
         height = self.data.qpos[2]
         upright = self._get_upright_reward()
-        return (height < 0.25)  or (upright < 0.25)
+        return (height < 0.4)  or (upright < 0.3)
 
 
     # ─────────────────────────── 辅助方法 ────────────────────────

@@ -79,7 +79,7 @@ def test():
             torch.save(agent.actor.state_dict(), save_path)
             logger.info(f"保存中间模型至: {save_path}")
 
-    final_save_path = os.path.join(model_dir, "g1_actor_final.pth")
+    final_save_path = os.path.join(model_dir, "g1_actor_final_2026014.pth")
     # 建议同时保存 Actor 和 Critic，方便以后“断点续训”
     torch.save({
         'episode': config["train"]["max_episodes"],

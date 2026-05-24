@@ -30,7 +30,8 @@ DETERMINISTIC = True
 RENDER = True
 EPISODE_STEPS = 2000
 
-MODEL_PATH = "/outputs/model/ppo_train/g1_actor_final_2026014.pth"
+MODEL_PATH = r"Y:\RobotTransition\Project\cyRobotic\RLControlHumanoid\outputs\model\ppo_train\g1_actor_3900.pth"
+
 
 
 # ---------- 加载环境 ----------
@@ -62,7 +63,7 @@ if RENDER:
     viewer.cam.distance = 3.0
 
 for step in range(EPISODE_STEPS):
-    obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(device)
+    obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
 
     with torch.no_grad():
         mu, _ = actor(obs_tensor)
@@ -80,6 +81,8 @@ for step in range(EPISODE_STEPS):
 
     if done:
         print(f"Episode ended at step {step}, total reward = {total_reward:.2f}")
+        time.sleep(5)
+        break
 
     obs = next_obs
 

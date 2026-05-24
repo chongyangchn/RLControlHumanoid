@@ -67,8 +67,8 @@ class PPOAgent:
 
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.actor = Actor(obs_dim, action_dim, self.hidden_dim)
-        self.critic = Critic(obs_dim, self.hidden_dim)
+        self.actor = Actor(obs_dim, action_dim, self.hidden_dim).to(self.device)
+        self.critic = Critic(obs_dim, self.hidden_dim).to(self.device)
 
         self.optimizer = optim.Adam([
             {'params': self.actor.parameters(), 'lr': self.lr},
@@ -85,7 +85,13 @@ class PPOAgent:
             nn.init.constant_(module.bias, 0)
 
     def get_action(self, obs, deterministic=False):
-        obs = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
+        # obs = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
+        # 修改后（兼容 CPU 和 CUDA）：
+        if not isinstance(obs, torch.Tensor):
+            obs = torch.FloatTensor(obs)
+        # 确保已经在正确的设备上，并增加 batch 维度
+        obs = obs.to(self.device).unsqueeze(0)
+
         with torch.no_grad():
             mu, std = self.actor(obs)
             std = std + 1e-6 # 防止除零，也提供最小探索
@@ -102,11 +108,25 @@ class PPOAgent:
 
     def update(self, buffer):
         # 1. 提取 Buffer 中的所有数据并转为 Tensor
-        states = torch.FloatTensor(np.array(buffer.states)).to(self.device)
-        actions = torch.FloatTensor(np.array(buffer.actions)).to(self.device)
-        log_probs_old = torch.FloatTensor(np.array(buffer.log_probs)).to(self.device)
-        returns = torch.FloatTensor(np.array(buffer.returns)).to(self.device)
-        advantages = torch.FloatTensor(np.array(buffer.advantages)).to(self.device)
+        # 这里将数据修改为tensor后就不能使用np数组了
+        # states = torch.FloatTensor(np.array(buffer.states)).to(self.device)
+        # actions = torch.FloatTensor(np.array(buffer.actions)).to(self.device)
+        # log_probs_old = torch.FloatTensor(np.array(buffer.log_probs)).to(self.device)
+        # returns = torch.FloatTensor(np.array(buffer.returns)).to(self.device)
+        # advantages = torch.FloatTensor(np.array(buffer.advantages)).to(self.device)
+
+        # 安全地提取数据，兼容 Tensor 或 NumPy 元素
+        def to_tensor(lst, device):
+            # 如果列表里的第一个元素是 numpy 或 tensor，都转为 tensor 并堆叠
+            tensors = [torch.as_tensor(item, dtype=torch.float32) for item in lst]
+            return torch.stack(tensors).to(device)
+
+        # 使用 to_tensor 辅助函数替代 torch.stack
+        states = to_tensor(buffer.states, self.device)
+        actions = to_tensor(buffer.actions, self.device)
+        log_probs_old = to_tensor(buffer.log_probs, self.device)
+        returns = to_tensor(buffer.returns, self.device)
+        advantages = to_tensor(buffer.advantages, self.device)
 
         # 优势归一化：这能显著稳定仿人机器人的训练
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)

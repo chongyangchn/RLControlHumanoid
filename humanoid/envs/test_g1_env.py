@@ -40,6 +40,8 @@ right_ankle_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "right_
 print(f"left_ankle_body_id is {left_ankle_body_id}")  # 7
 print(f"right_ankle_body_id is {right_ankle_body_id}")  # 13
 
+height = data.qpos[2:3]
+print(f"当前机器人的重心高度是：{height}")
 # # print("开始验证脚部几何体...")
 # for i in range(model.ngeom):
 #

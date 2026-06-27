@@ -26,7 +26,7 @@ class RewTerm:
 
 def track_lin_vel_xy_yaw_frame_exp(env, std: float = 0.25) -> torch.Tensor:
     """
-    在机器人局部坐标系下追踪线速度（X, Y）。
+    线速度跟踪的奖励
     """
     # 使用缓存 Tensor (而不是 env.data)
     base_quat = env.qpos_tensor[3:7]  # (4,)
@@ -43,57 +43,89 @@ def track_lin_vel_xy_yaw_frame_exp(env, std: float = 0.25) -> torch.Tensor:
 
     local_vel = torch.stack([vx, vy], dim=-1)  # (2,)
 
-    cmd_vel = torch.tensor([0.6, 0.0], device=local_vel.device)  # 目标速度
-    error = torch.norm(cmd_vel - local_vel, dim=-1)
-    return torch.exp(-error / (std ** 2))
+    cmd_vel = torch.tensor([env.command_lin_vel_x, 0.0], device=local_vel.device)
+    vel_error = torch.norm(cmd_vel - local_vel, dim=-1)
+    return torch.exp(-(vel_error ** 2) / (std ** 2))
 
 
 def track_ang_vel_z(env, std: float = 0.5) -> torch.Tensor:
+    """
+    角速度跟踪的奖励
+    """
     yaw_rate = env.qvel_tensor[5]  # 偏航角速度
-    cmd_yaw_rate = torch.tensor(0.0, device=yaw_rate.device)
-    error = torch.abs(cmd_yaw_rate - yaw_rate)
-    return torch.exp(-error / (std ** 2))
+    cmd_yaw_rate = torch.tensor(env.command_yaw_rate, device=yaw_rate.device)
+    yaw_rate_error = torch.abs(cmd_yaw_rate - yaw_rate)  # 目标横摆角速度 0rad/s
+    return torch.exp(-(yaw_rate_error ** 2) / (std ** 2))
 
 
 def is_alive(env) -> torch.Tensor:
+    """
+    生存奖励
+    """
     return torch.tensor(1.0, device=env.device)
 
 
 def flat_orientation_l2(env) -> torch.Tensor:
+    """
+    身体倾斜误差的奖励
+    """
     quat = env.qpos_tensor[3:7]  # 从缓存读取
     qw, qx, qy, qz = quat.unbind(-1)
     zx = 2 * (qx * qz + qy * qw)
     zy = 2 * (qy * qz - qx * qw)
-    zz = 1 - 2 * (qx ** 2 + qy ** 2)
+    zz = 1 - 2 * (qx ** 2 + qy ** 2)  # 如果机器人完美直立，它的局部 Z 轴应该与全局 Z 轴完全重合，即 zx=0, zy=0, zz=1。
     error = torch.sqrt(zx ** 2 + zy ** 2 + (zz - 1) ** 2)
     return torch.exp(-10.0 * error)  # 返回 [0, 1]
 
 
 def base_height_l2(env, target_height: float = 0.78) -> torch.Tensor:
+    """
+    重心高度偏离惩罚
+    """
     height = env.qpos_tensor[2]  # 从缓存读取
     return torch.exp(-10.0 * (height - target_height) ** 2)  # 返回 [0, 1]
 
 
 def joint_acc(env) -> torch.Tensor:
+    """
+    加速度冲击
+    """
     acc = env.qacc_tensor[6:]  # 跳过基座
-    return -torch.exp(-0.1 * torch.mean(acc ** 2))
+    return - torch.tanh(0.1 * torch.mean(acc ** 2))  # 使用 tanh 把惩罚控制在 [-1, 0] 之间
 
 
 def action_rate(env, action: torch.Tensor) -> torch.Tensor:
-    rate = torch.mean((action - env.last_action_tensor) ** 2)
-    return -rate
+    """
+    动作变化率
+    """
+    previous_action = getattr(env, "prev_action_tensor", env.last_action_tensor)
+    rate = torch.mean((action - previous_action) ** 2)
+    return - torch.tanh(0.1 * rate)  # 使用 tanh 把惩罚控制在 [-1, 0] 之间
+
+
+def action_magnitude(env, action: torch.Tensor) -> torch.Tensor:
+    """
+    惩罚动作幅度，避免站立阶段靠打满关节来“骗”高度奖励。
+    """
+    return -torch.tanh(torch.mean(action ** 2))
 
 
 def feet_slide(env) -> torch.Tensor:
+    """
+    脚滑的奖励
+    """
     # 使用缓存 Tensor
     contacts = env.foot_contacts_tensor  # (2,) [左, 右]
     foot_vel = env.qvel_tensor[0:3]  # 用基座速度近似
     slide = torch.norm(foot_vel[:2])
-    penalty = torch.where((contacts[0] == 1) | (contacts[1] == 1), -0.5 * slide, 0.0)
+    penalty = torch.where((contacts[0] == 1) | (contacts[1] == 1), -0.5 * torch.tanh(slide), 0.0) # 将 slide 映射到 [0, 1) 再乘以 0.5
     return penalty
 
 
 def gait(env) -> torch.Tensor:
+    """
+    步态的奖励，鼓励左右脚交替
+    """
     contacts = env.foot_contacts_tensor  # (2,)
     left = contacts[0]
     right = contacts[1]
@@ -103,32 +135,45 @@ def gait(env) -> torch.Tensor:
 
 
 def joint_vel(env) -> torch.Tensor:
+    """
+    关节速度奖励，惩罚关节速度太快
+    """
     vel = env.qvel_tensor[6:]  # 跳过基座
-    return -torch.exp(-0.1 * torch.mean(vel ** 2)) * 0.001
+    return -torch.tanh(0.1 * torch.mean(vel ** 2))
 
 
 def dof_pos_limits(env) -> torch.Tensor:
+    """
+    关节限位奖励奖励，惩罚关节速度太快
+    """
     qpos = env.qpos_tensor[7:]  # 跳过基座
+    num_joints = qpos.shape[0]
     low = env.joint_low_tensor
     high = env.joint_high_tensor
-    violation = torch.sum((qpos - low < 0.05) | (high - qpos < 0.05))
-    return -violation.float()
+    violation = torch.sum((qpos - low < 0.05) | (high - qpos < 0.05))  # 靠近限位的关节数量
+    return - violation.float()  / num_joints  # 除以关节总数，使最大惩罚为 -1.0
 
 
 def energy(env) -> torch.Tensor:
+    """
+    能量奖励，惩罚耗能较多
+    """
     torque = env.ctrl_tensor
     vel = env.qvel_tensor[6:]
-    power = torch.sum(torch.abs(torque * vel))
-    return -1e-4 * power
+    power = torch.sum(torch.abs(torque * vel))  # power 是扭矩 × 速度的绝对值之和
+    return -torch.tanh(1e-4 * power)
 
 
 def joint_deviation_arms(env) -> torch.Tensor:
+    """
+    能量奖励，惩罚耗能较多
+    """
     # 假设索引（需根据实际 XML 调整）
     indices = torch.tensor([14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27], device=env.device)
     qpos = env.qpos_tensor[7:]
     default = env.default_stand_tensor[indices]
     current = qpos[indices]
-    return -torch.mean((current - default) ** 2)
+    return -torch.tanh( torch.mean((current - default) ** 2) )
 
 
 def joint_deviation_waists(env) -> torch.Tensor:
@@ -136,7 +181,7 @@ def joint_deviation_waists(env) -> torch.Tensor:
     qpos = env.qpos_tensor[7:]
     default = env.default_stand_tensor[indices]
     current = qpos[indices]
-    return -torch.mean((current - default) ** 2)
+    return -torch.tanh(torch.mean((current - default) ** 2))
 
 
 def joint_deviation_legs(env) -> torch.Tensor:
@@ -144,10 +189,20 @@ def joint_deviation_legs(env) -> torch.Tensor:
     qpos = env.qpos_tensor[7:]
     default = env.default_stand_tensor[indices]
     current = qpos[indices]
-    return -torch.mean((current - default) ** 2)
+    return -torch.tanh(torch.mean((current - default) ** 2))
+
+
+def joint_deviation_all(env) -> torch.Tensor:
+    qpos = env.qpos_tensor[7:]
+    default = env.default_stand_tensor
+    return -torch.tanh(torch.mean((qpos - default) ** 2))
 
 
 def feet_clearance(env, target_height: float = 0.05) -> torch.Tensor:
+    """
+
+    """
+
     foot_height = env.qpos_tensor[2] - 0.4  # 近似
     return torch.where(foot_height < 0, 0.0, -((foot_height - target_height) ** 2))
 
@@ -171,32 +226,48 @@ def undesired_contacts(env) -> torch.Tensor:
 # --------------------- 组合奖励 ---------------------
 
 def compute_total_reward(env, action: torch.Tensor) -> torch.Tensor:
+    stage = getattr(env, "training_stage", "stand")
+    action_magnitude_weight = 0.4
+    joint_deviation_weight = 0.6
+    if stage == "balance":
+        action_magnitude_weight = 0.3
+        joint_deviation_weight = 0.4
+    elif stage in ("walk", "gait"):
+        action_magnitude_weight = 0.15
+        joint_deviation_weight = 0.2
+
     terms = [
-        # --- ✅ 正向奖励：让它活下去、走起来 ---
-        RewTerm(track_lin_vel_xy_yaw_frame_exp, weight=1.5),
-        RewTerm(track_ang_vel_z, weight=0.5),
-        RewTerm(is_alive, weight=1.0),
-
-        # --- ✅ 姿态保持：改为正向奖励，不再惩罚 ---
-        RewTerm(flat_orientation_l2, weight=1.0),
-        RewTerm(base_height_l2, weight=1.0, params={"target_height": 0.78}),
-
-        # --- ⚠️ 致命惩罚：必须用 exp 压制，防止数值爆炸 ---
-        RewTerm(joint_acc, weight=-1.0),
-        RewTerm(action_rate, weight=-1.0, params={"action": action}),
-        RewTerm(feet_slide, weight=-0.5),
-        RewTerm(gait, weight=-0.1),
-
-        # --- 🔧 其他精细化控制 ---
-        RewTerm(joint_vel, weight=0.2),
-        RewTerm(dof_pos_limits, weight=-0.0001),
-        RewTerm(energy, weight=-0.0001),
-        RewTerm(joint_deviation_arms, weight=-0.02),
-        RewTerm(joint_deviation_waists, weight=-0.02),
-        RewTerm(joint_deviation_legs, weight=-0.02),
-        RewTerm(feet_clearance, weight=-0.02),
-        # RewTerm(undesired_contacts, weight=-1.0),  # 暂时注释掉，以免报错
+        RewTerm(is_alive, weight=0.2),
+        RewTerm(flat_orientation_l2, weight=1.5),
+        RewTerm(base_height_l2, weight=1.5, params={"target_height": 0.793}),
+        RewTerm(joint_vel, weight=0.05),
+        RewTerm(joint_acc, weight=0.05),
+        RewTerm(action_rate, weight=0.3, params={"action": action}),
+        RewTerm(action_magnitude, weight=action_magnitude_weight, params={"action": action}),
+        RewTerm(joint_deviation_all, weight=joint_deviation_weight),
+        RewTerm(dof_pos_limits, weight=0.2),
+        RewTerm(energy, weight=0.0001),
     ]
+
+    if stage in ("balance", "walk", "gait"):
+        terms += [
+            RewTerm(track_ang_vel_z, weight=0.5),
+            RewTerm(joint_deviation_arms, weight=0.1),
+            RewTerm(joint_deviation_waists, weight=0.1),
+        ]
+
+    if stage in ("walk", "gait"):
+        terms += [
+            RewTerm(track_lin_vel_xy_yaw_frame_exp, weight=1.0),
+            RewTerm(feet_slide, weight=0.05),
+        ]
+
+    if stage == "gait":
+        terms += [
+            RewTerm(gait, weight=0.5),
+            RewTerm(feet_clearance, weight=0.1),
+        ]
+
     total = torch.tensor(0.0, device=action.device)
     for t in terms:
         total += t(env)

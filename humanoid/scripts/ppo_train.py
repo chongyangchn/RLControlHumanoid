@@ -33,6 +33,8 @@ class RunningMeanStd:
         x = np.asarray(x, dtype=np.float64)
         if x.ndim == 0:
             x = x.reshape(1)
+        if self.mean.shape != () and x.shape == self.mean.shape:
+            x = x.reshape(1, *self.mean.shape)
         batch_mean = x.mean(axis=0)
         batch_var = x.var(axis=0)
         batch_count = x.shape[0]
@@ -52,6 +54,20 @@ class RunningMeanStd:
             return (x - mean_tensor) / std_tensor
         else:
             return (x - self.mean) / (np.sqrt(self.var) + self.epsilon)
+
+    def state_dict(self):
+        return {
+            "mean": self.mean,
+            "var": self.var,
+            "count": self.count,
+            "epsilon": self.epsilon,
+        }
+
+    def load_state_dict(self, state):
+        self.mean = np.asarray(state["mean"], dtype=np.float64)
+        self.var = np.asarray(state["var"], dtype=np.float64)
+        self.count = int(state.get("count", 0))
+        self.epsilon = state.get("epsilon", self.epsilon)
 
 class RewardNormalizer:
     def __init__(self, shape=(), epsilon=1e-8):
@@ -97,7 +113,9 @@ class RewardNormalizer:
 
     def normalize(self, x):
         if isinstance(x, torch.Tensor):
-            return (x - self.mean) / (np.sqrt(self.var) + self.epsilon)
+            mean = torch.as_tensor(self.mean, dtype=torch.float32, device=x.device)
+            std = torch.as_tensor(np.sqrt(self.var) + self.epsilon, dtype=torch.float32, device=x.device)
+            return (x - mean) / std
         return (x - self.mean) / (np.sqrt(self.var) + self.epsilon)
 
 
@@ -146,11 +164,33 @@ def test():
     reward_norm = RewardNormalizer()
     obs_normalizer = RunningMeanStd(shape=(env.obs_dim,))
 
-    for episode in range(max_episodes):
+    resume_from = config["train"].get("resume_from")
+    start_episode = 0
+    if resume_from:
+        checkpoint = torch.load(resume_from, map_location=agent.device, weights_only=False)
+        if "actor_state_dict" in checkpoint:
+            agent.actor.load_state_dict(checkpoint["actor_state_dict"])
+            if "critic_state_dict" in checkpoint:
+                agent.critic.load_state_dict(checkpoint["critic_state_dict"])
+            if config["train"].get("resume_optimizer", False) and "optimizer_state_dict" in checkpoint:
+                agent.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            if not config["train"].get("reset_obs_normalizer", False) and "obs_normalizer" in checkpoint:
+                obs_normalizer.load_state_dict(checkpoint["obs_normalizer"])
+            start_episode = int(checkpoint.get("episode", 0)) + 1
+            logger.info(f"从 checkpoint 继续训练: {resume_from}")
+        else:
+            agent.actor.load_state_dict(checkpoint)
+            logger.info(f"加载旧格式 actor 权重: {resume_from}")
+
+    for episode in range(start_episode, max_episodes):
         obs = env.reset()
         # ----- 新增：对初始观测进行归一化 -----
         obs = obs_normalizer.normalize(obs)
-        episode_reward = 0
+        rollout_reward = 0.0
+        completed_episode_rewards = []
+        completed_episode_lengths = []
+        current_episode_reward = 0.0
+        current_episode_length = 0
 
         for step in range(steps_per_epoch):
             # 1. 采集数据
@@ -167,9 +207,16 @@ def test():
             buffer.store(obs, action, normalized_reward, log_prob, value, done)
             # ------------------------------------------------
             obs = next_obs
-            episode_reward += reward
+            reward_value = float(reward.detach().cpu())
+            rollout_reward += reward_value
+            current_episode_reward += reward_value
+            current_episode_length += 1
 
             if done:
+                completed_episode_rewards.append(current_episode_reward)
+                completed_episode_lengths.append(current_episode_length)
+                current_episode_reward = 0.0
+                current_episode_length = 0
                 obs = env.reset()  # 注意：这里重置后继续收集，无需特殊处理, 但 done 会在 GAE 中影响计算
                 obs = obs_normalizer.normalize(obs)
 
@@ -177,19 +224,40 @@ def test():
         with torch.no_grad():
             _, _, last_value = agent.get_action(obs) # obs最后一步之后的 next_obs
         buffer.finish_path(last_value)
+        action_array = np.asarray(buffer.actions, dtype=np.float32)
+        action_abs_mean = float(np.mean(np.abs(action_array)))
+        action_abs_max = float(np.max(np.abs(action_array)))
 
         # 3. PPO更新
         loss_dict = agent.update(buffer)
         buffer.clear()
 
         # 3. 计算并记录日志
-        logger.log_scalar("Train/Reward", episode_reward, episode)
+        mean_episode_reward = float(np.mean(completed_episode_rewards)) if completed_episode_rewards else current_episode_reward
+        mean_episode_length = float(np.mean(completed_episode_lengths)) if completed_episode_lengths else current_episode_length
+        done_rate = len(completed_episode_lengths) / max(1, steps_per_epoch)
+        logger.log_scalar("Train/RolloutReward", rollout_reward, episode)
+        logger.log_scalar("Train/EpisodeReward", mean_episode_reward, episode)
+        logger.log_scalar("Train/EpisodeLength", mean_episode_length, episode)
+        logger.log_scalar("Train/DoneCount", len(completed_episode_lengths), episode)
+        logger.log_scalar("Train/DoneRate", done_rate, episode)
+        logger.log_scalar("Train/CommandLinVelX", env.command_lin_vel_x, episode)
+        logger.log_scalar("Policy/ActionAbsMean", action_abs_mean, episode)
+        logger.log_scalar("Policy/ActionAbsMax", action_abs_max, episode)
         logger.log_scalar("Loss/Actor", loss_dict["actor_loss"], episode)
         logger.log_scalar("Loss/Critic", loss_dict["critic_loss"], episode)
 
-        if episode % 300 == 0:
+        checkpoint_interval = config["train"].get("checkpoint_interval", 300)
+        if episode % checkpoint_interval == 0:
             save_path = os.path.join(model_dir, f"g1_actor_{episode}.pth")
-            torch.save(agent.actor.state_dict(), save_path)
+            torch.save({
+                'episode': episode,
+                'actor_state_dict': agent.actor.state_dict(),
+                'critic_state_dict': agent.critic.state_dict(),
+                'optimizer_state_dict': agent.optimizer.state_dict(),
+                'obs_normalizer': obs_normalizer.state_dict(),
+                'config': config,
+            }, save_path)
             logger.info(f"保存中间模型至: {save_path}")
 
         # if episode % 100 == 0:
@@ -207,6 +275,8 @@ def test():
         'actor_state_dict': agent.actor.state_dict(),
         'critic_state_dict': agent.critic.state_dict(),
         'optimizer_state_dict': agent.optimizer.state_dict(),
+        'obs_normalizer': obs_normalizer.state_dict(),
+        'config': config,
     }, final_save_path)
     logger.info(f"训练完成！最终模型已保存至: {final_save_path}")
 

@@ -30,12 +30,12 @@ class Actor(nn.Module):
             nn.Linear(hidden_dim, action_dim),
             nn.Tanh()  # 将均值限制在 [-1, 1]
         )
-        # 可学习的标准差 log_std，初始设为 -0.5 (对应 std 约为 0.6)
-        self.log_std = nn.Parameter(torch.ones(1, action_dim) * -0.5)
+        # 初始探索不要太猛。G1 是高维 position control，std 过大会直接把动作打满。
+        self.log_std = nn.Parameter(torch.ones(1, action_dim) * -1.5)
 
     def forward(self, obs):
         mu = self.net(obs)
-        std = torch.exp(self.log_std)
+        std = torch.exp(torch.clamp(self.log_std, -5.0, 0.0))
         return mu, std
 
 # 2. 价值网络 (Critic)
@@ -64,6 +64,8 @@ class PPOAgent:
         self.hidden_dim = cfg["hidden_dim"]
         self.batch_size = cfg["batch_size"]
         self.update_epochs = cfg["update_epochs"]
+        self.entropy_coef = cfg.get("entropy_coef", 0.01)
+        self.value_loss_coef = cfg.get("value_loss_coef", 0.5)
 
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -84,6 +86,15 @@ class PPOAgent:
             nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
             nn.init.constant_(module.bias, 0)
 
+    def _atanh(self, x):
+        x = torch.clamp(x, -0.999, 0.999)
+        return 0.5 * (torch.log1p(x) - torch.log1p(-x))
+
+    def _squashed_log_prob(self, dist, raw_action, action):
+        log_prob = dist.log_prob(raw_action).sum(dim=-1)
+        squash_correction = torch.log(1.0 - action.pow(2) + 1e-6).sum(dim=-1)
+        return log_prob - squash_correction
+
     def get_action(self, obs, deterministic=False):
         # obs = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
         # 修改后（兼容 CPU 和 CUDA）：
@@ -96,12 +107,13 @@ class PPOAgent:
             mu, std = self.actor(obs)
             std = std + 1e-6 # 防止除零，也提供最小探索
             if deterministic:
-                action = mu
+                action = torch.tanh(mu)
                 return action.squeeze(0).cpu().numpy(), None, None
 
             dist = Normal(mu, std)
-            action = dist.sample()
-            log_prob = dist.log_prob(action).sum(dim=-1)
+            raw_action = dist.rsample()
+            action = torch.tanh(raw_action)
+            log_prob = self._squashed_log_prob(dist, raw_action, action)
             value = self.critic(obs)
 
         return action.squeeze(0).cpu().numpy(), log_prob.squeeze(0).cpu().numpy(), value.squeeze(0).cpu().item()
@@ -144,7 +156,8 @@ class PPOAgent:
                 # 计算当前的动作分布
                 mu, std = self.actor(states[idx])
                 dist = Normal(mu, std)
-                log_probs_now = dist.log_prob(actions[idx]).sum(dim=-1)
+                raw_actions = self._atanh(actions[idx])
+                log_probs_now = self._squashed_log_prob(dist, raw_actions, actions[idx])
                 entropy = dist.entropy().sum(dim=-1).mean()
 
                 # 计算 Ratio (重要性采样比率)
@@ -160,7 +173,7 @@ class PPOAgent:
                 critic_loss = nn.MSELoss()(values_now, returns[idx])
 
                 # 总损失 (加入熵正则化鼓励探索)
-                loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy
+                loss = actor_loss + self.value_loss_coef * critic_loss - self.entropy_coef * entropy
 
                 total_actor_loss += actor_loss.item()
                 total_critic_loss += critic_loss.item()

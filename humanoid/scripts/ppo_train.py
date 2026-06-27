@@ -47,7 +47,7 @@ class RunningMeanStd:
 
     def normalize(self, x):
         if isinstance(x, torch.Tensor):
-            # 关键修复：将 numpy 数据转为与 x 相同设备的 tensor
+            # 关键修复：将 numpy 数据转为�?x 相同设备�?tensor
             device = x.device
             mean_tensor = torch.as_tensor(self.mean, dtype=torch.float32, device=device)
             std_tensor = torch.as_tensor(np.sqrt(self.var) + self.epsilon, dtype=torch.float32, device=device)
@@ -79,7 +79,7 @@ class RewardNormalizer:
     def update(self, x):
         # --- 核心修复：兼容标量、tensor、numpy ---
         if isinstance(x, torch.Tensor):
-            # 标量 Tensor (0维) 转为 1维
+            # 标量 Tensor (0�? 转为 1�?
             if x.ndim == 0:
                 x = x.view(-1)
             x = x.detach().cpu().numpy()
@@ -88,11 +88,11 @@ class RewardNormalizer:
         elif isinstance(x, list):
             x = np.array(x)
 
-        # 确保 x 是 numpy 数组
+        # 确保 x �?numpy 数组
         if not isinstance(x, np.ndarray):
             x = np.array(x, dtype=np.float64)
 
-        # 如果 x 是标量 numpy 数组（形状为 ()），则 reshape 为 (1,)
+        # 如果 x 是标�?numpy 数组（形状为 ()），�?reshape �?(1,)
         if x.ndim == 0:
             x = x.reshape(1)
 
@@ -127,24 +127,24 @@ def test():
     #     config={
     #         "learning_rate": 1e-4,
     #         "batch_size": 256,
-    #         "num_envs": 1,  # 你的单环境
+    #         "num_envs": 1,  # 你的单环�?
     #         "gamma": 0.99,
-    #         # 其他超参数...
+    #         # 其他超参�?..
     #     }
     # )
 
-    with open(r"Y:\RobotTransition\Project\cyRobotic\RLControlHumanoid\humanoid\configs\ppo_walking.yaml", "r",
+    with open("configs/ppo_walking.yaml", "r",
               encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
     logger_dir = config["path"]["logger_dir"]
     model_dir = config["path"]["model_dir"]
-    os.makedirs(model_dir, exist_ok=True) # 确保文件夹存在
+    os.makedirs(model_dir, exist_ok=True) # 确保文件夹存�?
 
-    # 1. 初始化 Logger
+    # 1. 初始�?Logger
     logger = RLLogger(log_dir=logger_dir)
 
-    xml_path = r"Y:\RobotTransition\Project\cyRobotic\RLControlHumanoid\resources\robots\unitree_g1\scene.xml"
+    xml_path = "resources/robots/unitree_g1/scene.xml"
     env = HumanoidG1Env(xml_path, config)
     obs_dim = env.obs_dim
     action_dim = env.action_dim
@@ -177,14 +177,14 @@ def test():
             if not config["train"].get("reset_obs_normalizer", False) and "obs_normalizer" in checkpoint:
                 obs_normalizer.load_state_dict(checkpoint["obs_normalizer"])
             start_episode = int(checkpoint.get("episode", 0)) + 1
-            logger.info(f"从 checkpoint 继续训练: {resume_from}")
+            logger.info(f"�?checkpoint 继续训练: {resume_from}")
         else:
             agent.actor.load_state_dict(checkpoint)
-            logger.info(f"加载旧格式 actor 权重: {resume_from}")
+            logger.info(f"加载旧格�?actor 权重: {resume_from}")
 
     for episode in range(start_episode, max_episodes):
         obs = env.reset()
-        # ----- 新增：对初始观测进行归一化 -----
+        # ----- 新增：对初始观测进行归一�?-----
         obs = obs_normalizer.normalize(obs)
         rollout_reward = 0.0
         completed_episode_rewards = []
@@ -197,12 +197,12 @@ def test():
             action, log_prob, value = agent.get_action(obs)
             next_obs, reward, done, info = env.step(action)
             # ----- 新增：更新观测归一化统计量，再归一化下一时刻观测 -----
-            obs_normalizer.update(next_obs)  # 用新观测更新统计量
+            obs_normalizer.update(next_obs)  # 用新观测更新统计�?
             next_obs = obs_normalizer.normalize(next_obs)  # 再归一化，存入buffer
 
-            # ----------- 修改核心：奖励归一化 -----------
+            # ----------- 修改核心：奖励归一�?-----------
             reward_norm.update(reward)
-            # 2. 获得归一化后的奖励
+            # 2. 获得归一化后的奖�?
             normalized_reward = reward_norm.normalize(reward)
             buffer.store(obs, action, normalized_reward, log_prob, value, done)
             # ------------------------------------------------
@@ -217,11 +217,9 @@ def test():
                 completed_episode_lengths.append(current_episode_length)
                 current_episode_reward = 0.0
                 current_episode_length = 0
-                obs = env.reset()  # 注意：这里重置后继续收集，无需特殊处理, 但 done 会在 GAE 中影响计算
-                obs = obs_normalizer.normalize(obs)
+                obs = env.reset()  # 注意：这里重置后继续收集，无需特殊处理, �?done 会在 GAE 中影响计�?                obs = obs_normalizer.normalize(obs)
 
-        # 2. 计算 GAE 并更新网络
-        with torch.no_grad():
+        # 2. 计算 GAE 并更新网�?        with torch.no_grad():
             _, _, last_value = agent.get_action(obs) # obs最后一步之后的 next_obs
         buffer.finish_path(last_value)
         action_array = np.asarray(buffer.actions, dtype=np.float32)
@@ -232,7 +230,7 @@ def test():
         loss_dict = agent.update(buffer)
         buffer.clear()
 
-        # 3. 计算并记录日志
+        # 3. 计算并记录日�?
         mean_episode_reward = float(np.mean(completed_episode_rewards)) if completed_episode_rewards else current_episode_reward
         mean_episode_length = float(np.mean(completed_episode_lengths)) if completed_episode_lengths else current_episode_length
         done_rate = len(completed_episode_lengths) / max(1, steps_per_epoch)
@@ -258,7 +256,7 @@ def test():
                 'obs_normalizer': obs_normalizer.state_dict(),
                 'config': config,
             }, save_path)
-            logger.info(f"保存中间模型至: {save_path}")
+            logger.info(f"保存中间模型�? {save_path}")
 
         # if episode % 100 == 0:
         #     wandb.log({
@@ -269,7 +267,7 @@ def test():
         #     })
 
     final_save_path = os.path.join(model_dir, "g1_actor_final_2026014.pth")
-    # 建议同时保存 Actor 和 Critic，方便以后“断点续训”
+    # 建议同时保存 Actor �?Critic，方便以后“断点续训�?
     torch.save({
         'episode': config["train"]["max_episodes"],
         'actor_state_dict': agent.actor.state_dict(),
@@ -278,9 +276,10 @@ def test():
         'obs_normalizer': obs_normalizer.state_dict(),
         'config': config,
     }, final_save_path)
-    logger.info(f"训练完成！最终模型已保存至: {final_save_path}")
+    logger.info(f"训练完成！最终模型已保存�? {final_save_path}")
 
     print(f"Total time for {max_episodes} episodes: {time.time() - start:.2f} sec")
 
 if __name__ == "__main__":
     test()
+
